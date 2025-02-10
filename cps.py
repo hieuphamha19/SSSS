@@ -21,6 +21,7 @@ from Models.DeepLabV3Plus.modeling import *
 from Utils.pieces import DotDict
 from Utils.functions import fix_all_seed
 
+
 def main(config):
     """
     Main training function.
@@ -29,15 +30,15 @@ def main(config):
         config: Configuration object containing training parameters
     """
     # Setup datasets and dataloaders
-    dataset = get_dataset_without_full_label_without_val(
+    dataset = get_dataset_without_full_label(
         config, 
         img_size=config.data.img_size,
         train_aug=config.data.train_aug,
         k=config.fold,
-        lb_dataset=Dataset,
-        ulb_dataset=StrongWeakAugment
+        lb_dataset=SkinDataset2,
+        ulb_dataset=StrongWeakAugment4
     )
-      
+    
     l_train_loader = DataLoader(
         dataset['lb_dataset'],
         batch_size=config.train.l_batchsize,
@@ -55,7 +56,7 @@ def main(config):
     )
     
     val_loader = DataLoader(
-        dataset['lb_dataset'],
+        dataset['val_dataset'],
         batch_size=config.test.batch_size,
         shuffle=False,
         num_workers=config.test.num_workers,
@@ -63,7 +64,7 @@ def main(config):
     )
     
     test_loader = DataLoader(
-        dataset['lb_dataset'],
+        dataset['val_dataset'],
         batch_size=config.test.batch_size,
         shuffle=False,
         num_workers=config.test.num_workers,
@@ -74,9 +75,11 @@ def main(config):
     print(f"Unlabeled batches: {len(u_train_loader)}, Labeled batches: {len(l_train_loader)}")
 
     # Initialize models
+    # model1 = UNet(in_chns=3, class_num=3)
+    # model2 = UNet(in_chns=3, class_num=3)
     
-    model1 = deeplabv3plus_resnet50(num_classes=3, output_stride=8, pretrained_backbone=True)
-    model2 = deeplabv3plus_resnet50(num_classes=3, output_stride=8, pretrained_backbone=True)
+    model1 = deeplabv3plus_resnet101(num_classes=3, output_stride=8, pretrained_backbone=True)
+    model2 = deeplabv3plus_resnet101(num_classes=3, output_stride=8, pretrained_backbone=True)
 
     # Print model statistics
     total_params = sum(p.numel() for p in model1.parameters())
@@ -88,13 +91,13 @@ def main(config):
     model2 = model2.cuda()
 
     # Setup loss function
-    criterion = GeneralizedDiceFocalLoss(
-        include_background=True,
-        to_onehot_y=False,
-        softmax=True,
-        reduction='mean'
-    ).cuda()
-    criterion = [criterion]
+    criterion = [
+        GeneralizedDiceFocalLoss(
+            softmax=True,
+            to_onehot_y=False,
+            include_background=True
+        ).cuda()
+    ]
     
     global loss_weights
     loss_weights = [1.0]
@@ -114,9 +117,11 @@ def sigmoid_rampup(current, rampup_length):
     return float(np.exp(-5.0 * phase * phase))
 
 def get_current_consistency_weight(epoch):
+    """Calculate the consistency weight for the current epoch."""
     return args.consistency * sigmoid_rampup(epoch, args.consistency_rampup)
 
 def flatten_features(features):
+    """Flatten feature maps for cosine similarity calculation."""
     return [f.view(f.size(0), -1) for f in features]
 
 def calculate_cosine_similarity(features_1, features_2):
@@ -130,25 +135,19 @@ def calculate_cosine_similarity(features_1, features_2):
     Returns:
         Mean cosine similarity across all feature map pairs
     """
-    # Flatten feature maps
     flattened_1 = flatten_features(features_1)
     flattened_2 = flatten_features(features_2)
     
-    # Calculate cosine similarity for each feature map pair
     cosine_similarities = []
     for f1, f2 in zip(flattened_1, flattened_2):
         cos_sim = F.cosine_similarity(f1, f2, dim=1, eps=1e-6)
         cosine_similarities.append(cos_sim)
     
-    # Return mean similarity
     return torch.stack(cosine_similarities).mean()
 
-
-
-# =======================================================================================================
 def train_val(config, model1, model2, train_loader, val_loader, criterion):
     """
-    Training and validation function with Cross Pseudo Supervision.
+    Training and validation function with Cross Pseudo Supervision and CCVC.
     
     Args:
         config: Training configuration
@@ -173,17 +172,17 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
         weight_decay=float(config.train.optimizer.adamw.weight_decay)
     )
     
-    scheduler1 = optim.lr_scheduler.CosineAnnealingLR(optimizer1, T_max=config.train.num_epochs)
-    scheduler2 = optim.lr_scheduler.CosineAnnealingLR(optimizer2, T_max=config.train.num_epochs)
+    scheduler1 = optim.lr_scheduler.CosineAnnealingLR(optimizer1, T_max=config.train.num_epochs, eta_min=1e-6)
+    scheduler2 = optim.lr_scheduler.CosineAnnealingLR(optimizer2, T_max=config.train.num_epochs, eta_min=1e-6)
 
-    # Initialize MONAI metrics for training
     train_dice_1 = DiceMetric(include_background=True, reduction="mean")
     train_dice_2 = DiceMetric(include_background=True, reduction="mean")
     
-    max_dice = -float('inf')  # Khởi tạo giá trị Dice tốt nhất
+    
+    # Training loop
+    max_dice = -float('inf')  # Track the best Dice score
     best_epoch = 0
-    iter_num = 0
-    model = model1
+    model = model1  # Default model to return
     
     torch.save(model.state_dict(), best_model_dir)
     
@@ -194,16 +193,14 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
         model1.train()
         model2.train()
         train_metrics = {
-            'dice_1': 0, 'dice_2': 0, 'loss': 0
+            'dice_1': 0, 'iou_1': 0, 'hd_1': 0,
+            'dice_2': 0, 'iou_2': 0, 'hd_2': 0,
+            'loss': 0
         }
         num_train = 0
         
         source_dataset = zip(cycle(train_loader['l_loader']), train_loader['u_loader'])
         train_loop = tqdm(source_dataset, desc=f'Epoch {epoch} Training', leave=False)
-        
-        # Reset metrics at start of epoch
-        train_dice_1.reset()
-        train_dice_2.reset()
         
         for idx, (batch, batch_w_s) in enumerate(train_loop):
             # Get batch data
@@ -214,9 +211,9 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
             sup_batch_len = img.shape[0]
             unsup_batch_len = weak_batch.shape[0]
             
-            # Forward passes
-            output1 = torch.softmax(model1(img), dim=1)
-            output2 = torch.softmax(model2(img), dim=1)
+            # Forward passes with feature extraction
+            output1 = model1(img)
+            output2 = model2(img)
             
             # Supervised losses
             sup_loss_1 = criterion[0](output1, label)
@@ -224,30 +221,32 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
             
             # Generate pseudo-labels for CPS
             with torch.no_grad():
-                outputs_u1 = torch.softmax(model1(weak_batch), dim=1)
-                outputs_u2 = torch.softmax(model2(weak_batch), dim=1)
+                outputs_u1 = model1(weak_batch)
+                outputs_u2 = model2(weak_batch)
                 
                 # Create pseudo-labels based on confidence threshold
-                pseudo_mask_u1 = (outputs_u1.max(dim=1)[0] > config.semi.conf_thresh).float().unsqueeze(1)
-                pseudo_mask_u2 = (outputs_u2.max(dim=1)[0] > config.semi.conf_thresh).float().unsqueeze(1)
+                pseudo_mask_u1 = (outputs_u1.softmax(dim=1).max(dim=1)[0] > config.semi.conf_thresh).float()
+                pseudo_mask_u2 = (outputs_u2.softmax(dim=1).max(dim=1)[0] > config.semi.conf_thresh).float()
                 
-                # Convert to one-hot
-                pseudo_u1 = torch.zeros_like(outputs_u1)
-                pseudo_u1.scatter_(1, outputs_u1.argmax(dim=1, keepdim=True), 1)
-                pseudo_u2 = torch.zeros_like(outputs_u2)
-                pseudo_u2.scatter_(1, outputs_u2.argmax(dim=1, keepdim=True), 1)
+                # Convert to pseudo-labels
+                pseudo_u1 = outputs_u1.softmax(dim=1)
+                pseudo_u1 = torch.where(pseudo_mask_u1.unsqueeze(1) > 0, pseudo_u1,
+                                      torch.zeros_like(pseudo_u1))
+                pseudo_u2 = outputs_u2.softmax(dim=1)
+                pseudo_u2 = torch.where(pseudo_mask_u2.unsqueeze(1) > 0, pseudo_u2,
+                                      torch.zeros_like(pseudo_u2))
             
             # Unsupervised losses
             unsup_loss_1 = criterion[0](outputs_u1, pseudo_u2)
             unsup_loss_2 = criterion[0](outputs_u2, pseudo_u1)
             
             # Calculate consistency weight
-            consistency_weight = get_current_consistency_weight(iter_num // 150)
-            
+            consistency_weight = get_current_consistency_weight(idx // 150)
+                        
             # Total losses
             loss_1 = sup_loss_1 + unsup_loss_1 * consistency_weight * (sup_batch_len / unsup_batch_len)
             loss_2 = sup_loss_2 + unsup_loss_2 * consistency_weight * (sup_batch_len / unsup_batch_len)
-            loss = loss_1 + loss_2
+            loss = loss_1 + loss_2 
             
             # Optimization step
             optimizer1.zero_grad()
@@ -279,8 +278,6 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
                 'Dice1': f"{train_dice_1.aggregate().item():.4f}",
                 'Dice2': f"{train_dice_2.aggregate().item():.4f}"
             })
-            
-            iter_num += 1
             
             if config.debug:
                 break
@@ -317,7 +314,7 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
         # Log epoch time
         time_elapsed = time.time() - start
         print(f'Epoch {epoch} completed in {time_elapsed//60:.0f}m {time_elapsed%60:.0f}s')
-        
+        print('='*80)
         
         if config.debug:
             break
@@ -426,15 +423,10 @@ def test(config, model, model_dir, test_loader, criterion):
     file_log.write('='*80 + '\n')
     file_log.flush()
 
-
-
-
-if __name__=='__main__':
-    now = datetime.now()
-    torch.cuda.empty_cache()
-    parser = argparse.ArgumentParser(description='Train experiment')
-    parser.add_argument('--exp', type=str,default='tmp')
-    parser.add_argument('--config_yml', type=str,default='Configs/multi_train_local.yml')
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Train')
+    parser.add_argument('--exp', type=str, default='tmp')
+    parser.add_argument('--config_yml', type=str, default='Configs/multi_train_local.yml')
     parser.add_argument('--adapt_method', type=str, default=False)
     parser.add_argument('--num_domains', type=str, default=False)
     parser.add_argument('--dataset', type=str, nargs='+', default='chase_db1')
@@ -442,58 +434,52 @@ if __name__=='__main__':
     parser.add_argument('--gpu', type=str, default='0')
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--fold', type=int, default=2)
-    parser.add_argument('--consistency', type=float,
-                    default=0.1, help='consistency')
-    parser.add_argument('--consistency_rampup', type=float,
-                    default=200.0, help='consistency_rampup')
+    parser.add_argument('--consistency', type=float, default=0.1)
+    parser.add_argument('--consistency_rampup', type=float, default=200.0)
+    
     args = parser.parse_args()
+    
+    # Load and update config
     config = yaml.load(open(args.config_yml), Loader=yaml.FullLoader)
     config['data']['name'] = args.dataset
-    config['model_adapt']['adapt_method']=args.adapt_method
-    config['model_adapt']['num_domains']=args.num_domains
+    config['model_adapt']['adapt_method'] = args.adapt_method
+    config['model_adapt']['num_domains'] = args.num_domains
     config['data']['k_fold'] = args.k_fold
     config['seed'] = args.seed
     config['fold'] = args.fold
     
+    # Setup CUDA and seeds
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = True
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     fix_all_seed(config['seed'])
-
-    # print config and args
+    
+    # Print configuration
     print(yaml.dump(config, default_flow_style=False))
     for arg in vars(args):
-        print("{:<20}: {}".format(arg, getattr(args, arg)))
+        print(f"{arg:<20}: {getattr(args, arg)}")
     
     store_config = config
     config = DotDict(config)
     
-    folds_to_train = [1,2,3,4,5]
-    
-    for fold in folds_to_train:
+    # Train each fold
+    for fold in [1,2,3,4,5]:
         print(f"\n=== Training Fold {fold} ===")
         config['fold'] = fold
         
-        # Update paths for each fold
-        # exp_dir = '{}/{}_{}/fold{}'.format(config.data.save_folder, args.exp, config['data']['supervised_ratio'], fold)
-        exp_dir = '{}/{}/fold{}'.format(config.data.save_folder, args.exp, fold)
-        
+        # Setup directories
+        exp_dir = f"{config.data.save_folder}/{args.exp}/fold{fold}"
         os.makedirs(exp_dir, exist_ok=True)
-        best_model_dir = '{}/best.pth'.format(exp_dir)
-        test_results_dir = '{}/test_results.txt'.format(exp_dir)
-
-        # Store yml file for each fold
-        if config.debug == False:
-            yaml.dump(store_config, open('{}/exp_config.yml'.format(exp_dir), 'w'))
-            
-        file_log = open('{}/log.txt'.format(exp_dir), 'w')
+        best_model_dir = f'{exp_dir}/best.pth'
+        test_results_dir = f'{exp_dir}/test_results.txt'
         
-        # Train the model for this fold
-        main(config)
+        # Save config
+        if not config.debug:
+            yaml.dump(store_config, open(f'{exp_dir}/exp_config.yml', 'w'))
         
-        # Close the log file
-        file_log.close()
+        # Train fold
+        with open(f'{exp_dir}/log.txt', 'w') as file_log:
+            main(config)
         
-        # Clear GPU memory between folds
         torch.cuda.empty_cache()
