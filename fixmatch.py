@@ -29,12 +29,12 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from itertools import cycle
 
-from Datasets.create_dataset import get_dataset_without_full_label_without_val, SkinDataset2, StrongWeakAugment2
+from Datasets.create_dataset import *
 from Utils.pieces import DotDict
 from Utils.functions import fix_all_seed
 
-from Models.DeepLabV3Plus import deeplabv3plus_resnet101
-from monai.losses import DiceCELoss
+from Models.DeepLabV3Plus import *
+from monai.losses import *
 from monai.metrics import DiceMetric, HausdorffDistanceMetric, MeanIoU
 
 def main(config):
@@ -45,7 +45,7 @@ def main(config):
         config: Configuration object containing training parameters
     """
     # Setup datasets and dataloaders
-    dataset = get_dataset_without_full_label_without_val(
+    dataset = get_dataset_without_full_label(
         config, 
         img_size=config.data.img_size,
         train_aug=config.data.train_aug,
@@ -59,9 +59,7 @@ def main(config):
         batch_size=config.train.l_batchsize,
         shuffle=True,
         num_workers=config.train.num_workers,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=4
+        pin_memory=True
     )
     
     u_train_loader = DataLoader(
@@ -69,29 +67,24 @@ def main(config):
         batch_size=config.train.u_batchsize,
         shuffle=True,
         num_workers=config.train.num_workers,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=4
+        pin_memory=True
     )
     
     val_loader = DataLoader(
-        dataset['lb_dataset'],
+        dataset['val_dataset'],
         batch_size=config.test.batch_size,
         shuffle=False,
         num_workers=config.test.num_workers,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=4
+        pin_memory=True
     )
     
     test_loader = DataLoader(
-        dataset['lb_dataset'],
+        dataset['val_dataset'],
         batch_size=config.test.batch_size,
         shuffle=False,
         num_workers=config.test.num_workers,
         pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=4
+        drop_last=True
     )
     
     train_loader = {'l_loader': l_train_loader, 'u_loader': u_train_loader}
@@ -110,7 +103,7 @@ def main(config):
 
     # Setup loss function - thay đổi criterion
     criterion = [
-        DiceCELoss(
+        GeneralizedDiceFocalLoss(
             include_background=True,
             to_onehot_y=False,  
             softmax=True
@@ -156,7 +149,7 @@ def train_val(config, model, train_loader, val_loader, criterion):
         weight_decay=float(config.train.optimizer.adamw.weight_decay)
     )
     
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.train.num_epochs, eta_min=1e-6)
 
     # Initialize MONAI metrics for training
     train_dice = DiceMetric(include_background=True, num_classes=3, reduction="mean")
@@ -165,8 +158,6 @@ def train_val(config, model, train_loader, val_loader, criterion):
     # Training loop
     max_dice_score = -float('inf')  # Track the best Dice score
     best_epoch = 0
-    w_dice = 0.5  # Weight for Dice score
-    w_hd = 0.5    # Weight for HD score
     warmup_epochs = 15
     
     torch.save(model.state_dict(), best_model_dir)
@@ -276,7 +267,7 @@ def train_val(config, model, train_loader, val_loader, criterion):
         val_metrics = validate_model(model, val_loader, criterion)
         
         # Save best model based on Dice score
-        if val_metrics['dice'] > max_dice_score and epoch >= 20:
+        if val_metrics['dice'] > max_dice_score:
             max_dice_score = val_metrics['dice']
             best_epoch = epoch
             torch.save(model.state_dict(), best_model_dir)
@@ -352,7 +343,6 @@ def validate_model(model, val_loader, criterion):
     metrics['dice'] = dice_metric.aggregate().item()
     metrics['iou'] = iou_metric.aggregate().item()
     metrics['hd'] = hd_metric.aggregate().item()
-        
 
     # Reset metrics for next validation
     dice_metric.reset()
@@ -434,7 +424,7 @@ if __name__ == '__main__':
     config = DotDict(config)
     
     # Train each fold
-    for fold in [1]:
+    for fold in [1, 2, 3, 4, 5]:
         print(f"\n=== Training Fold {fold} ===")
         config['fold'] = fold
         
