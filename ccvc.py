@@ -13,7 +13,7 @@ import torch.utils.data
 from Datasets.create_dataset import *
 from Models.DeepLabV3Plus.modeling import *
 from Utils.utils import DotDict, fix_all_seed
-from monai.losses import DiceCELoss
+from monai.losses import GeneralizedDiceFocalLoss
 from monai.metrics import DiceMetric, MeanIoU, HausdorffDistanceMetric
 
 torch.cuda.empty_cache()
@@ -84,7 +84,7 @@ def main(config):
     model2 = model2.cuda()
 
     # Setup loss function
-    criterion = DiceCELoss(
+    criterion = GeneralizedDiceFocalLoss(
         include_background=True,
         to_onehot_y=False,
         softmax=True,

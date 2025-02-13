@@ -13,13 +13,12 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from itertools import cycle
-from monai.losses import *
-from monai.metrics import *
+from monai.losses import GeneralizedDiceFocalLoss
+from monai.metrics import DiceMetric, MeanIoU, HausdorffDistanceMetric
 
 from Datasets.create_dataset import *
 from Models.DeepLabV3Plus.modeling import *
-from Utils.pieces import DotDict
-from Utils.functions import fix_all_seed
+from Utils.utils import DotDict, fix_all_seed
 
 
 def main(config):
@@ -35,7 +34,7 @@ def main(config):
         img_size=config.data.img_size,
         train_aug=config.data.train_aug,
         k=config.fold,
-        lb_dataset=SkinDataset2,
+        lb_dataset=Dataset,
         ulb_dataset=StrongWeakAugment4
     )
     
