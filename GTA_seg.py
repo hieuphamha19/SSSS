@@ -13,13 +13,12 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from itertools import cycle
-from monai.losses import *
-from monai.metrics import *
+from monai.losses import GeneralizedDiceFocalLoss
+from monai.metrics import DiceMetric, MeanIoU, HausdorffDistanceMetric
 
 from Datasets.create_dataset import *
 from Models.DeepLabV3Plus.modeling import *
-from Utils.pieces import DotDict
-from Utils.functions import fix_all_seed
+from Utils.utils import DotDict, fix_all_seed
 
 def main(config):
     """
@@ -43,7 +42,8 @@ def main(config):
         batch_size=config.train.l_batchsize,
         shuffle=True,
         num_workers=config.train.num_workers,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=True
     )
     
     u_train_loader = DataLoader(
@@ -51,7 +51,8 @@ def main(config):
         batch_size=config.train.u_batchsize,
         shuffle=True,
         num_workers=config.train.num_workers,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=True
     )
     
     val_loader = DataLoader(
@@ -59,7 +60,8 @@ def main(config):
         batch_size=config.test.batch_size,
         shuffle=False,
         num_workers=config.test.num_workers,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=True
     )
     
     test_loader = DataLoader(
@@ -67,16 +69,17 @@ def main(config):
         batch_size=config.test.batch_size,
         shuffle=False,
         num_workers=config.test.num_workers,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=True
     )
     
     train_loader = {'l_loader': l_train_loader, 'u_loader': u_train_loader}
     print(f"Unlabeled batches: {len(u_train_loader)}, Labeled batches: {len(l_train_loader)}")
 
     # Initialize models
-    model_student = deeplabv3plus_resnet50(num_classes=3, output_stride=8, pretrained_backbone=True)
-    model_teacher = deeplabv3plus_resnet50(num_classes=3, output_stride=8, pretrained_backbone=True)
-    model_ta = deeplabv3plus_resnet50(num_classes=3, output_stride=8, pretrained_backbone=True)
+    model_student = deeplabv3plus_resnet101(num_classes=3, output_stride=8, pretrained_backbone=True)
+    model_teacher = deeplabv3plus_resnet101(num_classes=3, output_stride=8, pretrained_backbone=True)
+    model_ta = deeplabv3plus_resnet101(num_classes=3, output_stride=8, pretrained_backbone=True)
 
     # Print model statistics
     total_params = sum(p.numel() for p in model_student.parameters())
@@ -117,34 +120,10 @@ def sigmoid_rampup(current, rampup_length):
 def get_current_consistency_weight(epoch):
     return args.consistency * sigmoid_rampup(epoch, args.consistency_rampup)
 
-def flatten_features(features):
-    return [f.view(f.size(0), -1) for f in features]
-
-def calculate_cosine_similarity(features_1, features_2):
-    """
-    Calculate mean cosine similarity between two sets of feature maps.
-    
-    Args:
-        features_1: First set of feature maps
-        features_2: Second set of feature maps
-        
-    Returns:
-        Mean cosine similarity across all feature map pairs
-    """
-    # Flatten feature maps
-    flattened_1 = flatten_features(features_1)
-    flattened_2 = flatten_features(features_2)
-    
-    # Calculate cosine similarity for each feature map pair
-    cosine_similarities = []
-    for f1, f2 in zip(flattened_1, flattened_2):
-        cos_sim = F.cosine_similarity(f1, f2, dim=1, eps=1e-6)
-        cosine_similarities.append(cos_sim)
-    
-    # Return mean similarity
-    return torch.stack(cosine_similarities).mean()
-
 def train_val(config, model, model_teacher, model_ta, train_loader, val_loader, criterion):
+    """
+    Training and validation function.
+    """
     # Setup optimizers
     optimizer = optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
@@ -160,11 +139,13 @@ def train_val(config, model, model_teacher, model_ta, train_loader, val_loader, 
     # Setup schedulers
     lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, 
-        T_max=config.train.num_epochs
+        T_max=config.train.num_epochs,
+        eta_min=1e-6
     )
     lr_scheduler_ta = optim.lr_scheduler.CosineAnnealingLR(
         optimizer_ta,
-        T_max=config.train.num_epochs
+        T_max=config.train.num_epochs,
+        eta_min=1e-6
     )
     
     # Initialize metrics
@@ -172,7 +153,6 @@ def train_val(config, model, model_teacher, model_ta, train_loader, val_loader, 
     max_dice = -float('inf')
     best_epoch = 0
     
-    # Training loop
     for epoch in range(config.train.num_epochs):
         start = time.time()
         
@@ -184,11 +164,11 @@ def train_val(config, model, model_teacher, model_ta, train_loader, val_loader, 
         train_metrics = {'dice': 0, 'sup_loss': 0, 'unsup_loss': 0}
         num_train = 0
 
-        # Use cycle for labeled data to match unlabeled data length
         source_dataset = zip(cycle(train_loader['l_loader']), train_loader['u_loader'])
-        num_batches = len(train_loader['u_loader'])  # Use unlabeled batch count
+        num_batches = len(train_loader['u_loader'])
         
-        train_loop = tqdm(source_dataset, total=num_batches, desc=f'Epoch {epoch} Training', leave=False)
+        train_loop = tqdm(source_dataset, total=num_batches, 
+                         desc=f'Epoch {epoch} Training', leave=False)
         train_dice.reset()
 
         for idx, (batch_l, batch_u) in enumerate(train_loop):
@@ -215,10 +195,10 @@ def train_val(config, model, model_teacher, model_ta, train_loader, val_loader, 
                 _ = model_ta(img_l)
                 
                 unsup_loss = torch.tensor(0.0).cuda()
-            
+                
             else:
                 if epoch == config.train.warmup_epochs:
-                    # Initialize teacher models with student weights
+                    # Initialize teacher and TA models with student weights
                     with torch.no_grad():
                         for t_params, s_params in zip(model_teacher.parameters(), model.parameters()):
                             t_params.data = s_params.data
@@ -263,9 +243,8 @@ def train_val(config, model, model_teacher, model_ta, train_loader, val_loader, 
                 model.eval()
                 with torch.no_grad():
                     ema_decay = min(1 - 1/(i_iter - len(train_loader['l_loader']) * config.train.warmup_epochs + 1), 0.999)
-                    for t_params, s_params in zip(model.named_parameters(), model_ta.named_parameters()):
-                        if 'module.decoder.classifier' not in t_params[0]:
-                            t_params[1].data = ema_decay * t_params[1].data + (1 - ema_decay) * s_params[1].data
+                    for t_params, s_params in zip(model.parameters(), model_ta.parameters()):
+                        t_params.data = ema_decay * t_params.data + (1 - ema_decay) * s_params.data
                 model.train()
 
             # Update learning rates
@@ -281,23 +260,54 @@ def train_val(config, model, model_teacher, model_ta, train_loader, val_loader, 
             # Update progress bar
             train_loop.set_postfix({
                 'Sup Loss': f"{sup_loss.item():.4f}",
-                'Unsup Loss': f"{unsup_loss.item():.4f}"
+                'Unsup Loss': f"{unsup_loss.item():.4f}",
+                'LR': f"{lr_scheduler.get_last_lr()[0]:.6f}"
             })
 
+            # Log to file
+            file_log.write(
+                f"Epoch {epoch}, Iter {idx}, "
+                f"Sup Loss: {sup_loss.item():.4f}, "
+                f"Unsup Loss: {unsup_loss.item():.4f}\n"
+            )
+            file_log.flush()
+
         # Validation phase
-        metrics = validate_model(model, val_loader, criterion)
+        if epoch < config.train.warmup_epochs:
+            metrics = validate_model(model, val_loader, criterion)
+        else:
+            metrics = validate_model(model_teacher, val_loader, criterion)
         
         # Update best model
         if metrics['dice'] > max_dice:
             max_dice = metrics['dice']
             best_epoch = epoch
             torch.save(model.state_dict(), best_model_dir)
+            
+            message = (f'New best epoch {epoch}! '
+                      f'Dice: {metrics["dice"]:.4f}')
+            print(message)
+            file_log.write(message + '\n')
+            file_log.flush()
         
         # Print epoch results
-        print(f"Epoch {epoch} - Sup Loss: {train_metrics['sup_loss']:.4f}, Unsup Loss: {train_metrics['unsup_loss']:.4f}")
-        print(f"Validation Dice: {metrics['dice']:.4f}")
+        epoch_time = time.time() - start
+        log_message = (
+            f"Epoch {epoch} completed in {epoch_time//60:.0f}m {epoch_time%60:.0f}s\n"
+            f"Sup Loss: {train_metrics['sup_loss']:.4f}, "
+            f"Unsup Loss: {train_metrics['unsup_loss']:.4f}\n"
+            f"Validation Dice: {metrics['dice']:.4f}"
+        )
+        print(log_message)
+        file_log.write(log_message + '\n')
+        file_log.write('='*80 + '\n')
+        file_log.flush()
 
-    return model
+        if config.debug:
+            break
+    
+    print(f'Training completed. Best epoch: {best_epoch}')
+    return model_teacher
 
 def validate_model(model, val_loader, criterion):
     """
@@ -400,9 +410,6 @@ def test(config, model, model_dir, test_loader, criterion):
     file_log.write('='*80 + '\n')
     file_log.flush()
 
-
-
-
 if __name__=='__main__':
     now = datetime.now()
     torch.cuda.empty_cache()
@@ -443,7 +450,7 @@ if __name__=='__main__':
     store_config = config
     config = DotDict(config)
     
-    folds_to_train = [1,2,3,4,5]
+    folds_to_train = [2,3,4,5]
     
     for fold in folds_to_train:
         print(f"\n=== Training Fold {fold} ===")
