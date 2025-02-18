@@ -249,7 +249,7 @@ def pre_train(config, snapshot_path, file_log):
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu)
     
     # Setup model paths
-    best_model_path = os.path.join(snapshot_path, 'best.pth')
+    best_model_path = os.path.join(snapshot_path, 'pre_train_best.pth')
     
     # Setup logging
     logging.basicConfig(filename=os.path.join(snapshot_path, 'training.log'),
@@ -431,8 +431,8 @@ def self_train(config, pre_snapshot_path, snapshot_path, file_log):
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu)
     
     # Setup model paths
-    pre_trained_path = os.path.join(pre_snapshot_path, 'best.pth')
-    best_model_path = os.path.join(snapshot_path, 'best.pth')
+    pre_trained_path = os.path.join(pre_snapshot_path, 'pre_train_best.pth')
+    best_model_path = os.path.join(snapshot_path, 'self_train_best.pth')
 
     # Create models and move to GPU
     model = create_model()
@@ -491,9 +491,10 @@ def self_train(config, pre_snapshot_path, snapshot_path, file_log):
         weight_decay=float(config.train.optimizer.adamw.weight_decay)
     )
 
+    # Load pre-trained weights
     load_net(ema_model, pre_trained_path)
     load_net_opt(model, optimizer, pre_trained_path)
-    logging.info("Loaded from {}".format(pre_trained_path))
+    logging.info("Loaded pre-trained model from {}".format(pre_trained_path))
 
     logging.info("Start self-training")
     logging.info("{} iterations per epoch".format(len(trainloader['l_loader'])))
