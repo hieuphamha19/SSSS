@@ -88,21 +88,21 @@ class DiceLoss(nn.Module):
                 
         return loss / self.n_classes
     
-def load_net(net, path):
-    state = torch.load(str(path))
-    net.load_state_dict(state['net'])
+def save_model(net, path):
+    """Save only model state dict."""
+    torch.save(net.state_dict(), str(path))
 
-def load_net_opt(net, optimizer, path):
-    state = torch.load(str(path))
-    net.load_state_dict(state['net'])
-    optimizer.load_state_dict(state['opt'])
+def save_optimizer(optimizer, path):
+    """Save only optimizer state dict."""
+    torch.save(optimizer.state_dict(), str(path))
 
-def save_net_opt(net, optimizer, path):
-    state = {
-        'net':net.state_dict(),
-        'opt':optimizer.state_dict(),
-    }
-    torch.save(state, str(path))
+def load_model(net, path):
+    """Load only model state dict."""
+    net.load_state_dict(torch.load(str(path)))
+
+def load_optimizer(optimizer, path):
+    """Load only optimizer state dict."""
+    optimizer.load_state_dict(torch.load(str(path)))
 
 def create_model(ema=False):
     """
@@ -250,6 +250,7 @@ def pre_train(config, snapshot_path, file_log):
     
     # Setup model paths
     best_model_path = os.path.join(snapshot_path, 'pre_train_best.pth')
+    best_optim_path = os.path.join(snapshot_path, 'pre_train_optim.pth')
     
     # Setup logging
     logging.basicConfig(filename=os.path.join(snapshot_path, 'training.log'),
@@ -401,7 +402,8 @@ def pre_train(config, snapshot_path, file_log):
 
         if performance > best_performance:
             best_performance = performance
-            save_net_opt(model, optimizer, best_model_path)
+            save_model(model, best_model_path)
+            save_optimizer(optimizer, best_optim_path)
             message = f'Saved new best model with dice {performance:.4f}'
             print(message)
             file_log.write(message + '\n')
@@ -431,8 +433,10 @@ def self_train(config, pre_snapshot_path, snapshot_path, file_log):
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu)
     
     # Setup model paths
-    pre_trained_path = os.path.join(pre_snapshot_path, 'pre_train_best.pth')
+    pre_trained_model_path = os.path.join(pre_snapshot_path, 'pre_train_best.pth')
+    pre_trained_optim_path = os.path.join(pre_snapshot_path, 'pre_train_optim.pth')
     best_model_path = os.path.join(snapshot_path, 'self_train_best.pth')
+    best_optim_path = os.path.join(snapshot_path, 'self_train_optim.pth')
 
     # Create models and move to GPU
     model = create_model()
@@ -484,17 +488,20 @@ def self_train(config, pre_snapshot_path, snapshot_path, file_log):
 
     print(f"Unlabeled batches: {len(trainloader['u_loader'])}, Labeled batches: {len(trainloader['l_loader'])}")
 
-    # Setup optimizer
+    # Setup optimizer first so we can load its state
     optimizer = optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=float(config.train.optimizer.adamw.lr),
         weight_decay=float(config.train.optimizer.adamw.weight_decay)
     )
 
-    # Load pre-trained weights
-    load_net(ema_model, pre_trained_path)
-    load_net_opt(model, optimizer, pre_trained_path)
-    logging.info("Loaded pre-trained model from {}".format(pre_trained_path))
+    # Load pre-trained weights and optimizer state
+    load_model(ema_model, pre_trained_model_path)
+    load_model(model, pre_trained_model_path)
+    load_optimizer(optimizer, pre_trained_optim_path)
+    
+    logging.info("Loaded pre-trained model from {}".format(pre_trained_model_path))
+    logging.info("Loaded pre-trained optimizer from {}".format(pre_trained_optim_path))
 
     logging.info("Start self-training")
     logging.info("{} iterations per epoch".format(len(trainloader['l_loader'])))
@@ -507,8 +514,6 @@ def self_train(config, pre_snapshot_path, snapshot_path, file_log):
     # Tính số epoch cho self-training
     max_epoch = config.train.num_epochs - config.train.warmup_epoch
 
-
-    
     for epoch in range(max_epoch):
         source_dataset = zip(cycle(trainloader['l_loader']), trainloader['u_loader'])
         train_loop = tqdm(source_dataset, desc=f'Epoch {epoch} Training', leave=False)
@@ -567,9 +572,12 @@ def self_train(config, pre_snapshot_path, snapshot_path, file_log):
 
         if performance > best_performance:
             best_performance = performance
-            save_net_opt(model, optimizer, best_model_path)
-            logging.info(f'Saved new best model with dice {performance:.4f}')
-            print(f'Saved new best model with dice {performance:.4f}')
+            save_model(model, best_model_path)
+            save_optimizer(optimizer, best_optim_path)
+            message = f'Saved new best model with dice {performance:.4f}'
+            print(message)
+            file_log.write(message + '\n')
+            file_log.flush()
 
         model.train()
 
