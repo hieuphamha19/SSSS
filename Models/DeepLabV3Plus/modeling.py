@@ -220,7 +220,13 @@ def deeplabv3plus_xception(num_classes=21, output_stride=8, pretrained_backbone=
         pretrained_backbone (bool): If True, use the pretrained backbone.
     """
     return _load_model('deeplabv3plus', 'xception', num_classes, output_stride=output_stride, pretrained_backbone=pretrained_backbone)
-    #---------------------------------CCT-----------------------------------------------
+#------------------------------------------CCT----------------------------------------------------
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions.uniform import Uniform
+import numpy as np
+import copy
 
 class DeepLabV3Plus_CCT(nn.Module):
     def __init__(self, backbone, classifier):
@@ -287,6 +293,60 @@ class FeatureNoise(nn.Module):
     def forward(self, x):
         x = self.feature_based_noise(x)
         return x
+
+
+class ASPPConv(nn.Sequential):
+    def __init__(self, in_channels, out_channels, dilation):
+        modules = [
+            nn.Conv2d(in_channels, out_channels, 3, padding=dilation, dilation=dilation, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU()
+        ]
+        super(ASPPConv, self).__init__(*modules)
+
+class ASPPPooling(nn.Sequential):
+    def __init__(self, in_channels, out_channels):
+        super(ASPPPooling, self).__init__(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU())
+
+    def forward(self, x):
+        size = x.shape[-2:]
+        x = super(ASPPPooling, self).forward(x)
+        return F.interpolate(x, size=size, mode='bilinear', align_corners=False)
+
+class ASPP(nn.Module):
+    def __init__(self, in_channels, atrous_rates):
+        super(ASPP, self).__init__()
+        out_channels = 256
+        modules = []
+        modules.append(nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU()))
+
+        rate1, rate2, rate3 = tuple(atrous_rates)
+        modules.append(ASPPConv(in_channels, out_channels, rate1))
+        modules.append(ASPPConv(in_channels, out_channels, rate2))
+        modules.append(ASPPConv(in_channels, out_channels, rate3))
+        modules.append(ASPPPooling(in_channels, out_channels))
+
+        self.convs = nn.ModuleList(modules)
+
+        self.project = nn.Sequential(
+            nn.Conv2d(5 * out_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(),
+            nn.Dropout(0.5))
+
+    def forward(self, x):
+        res = []
+        for conv in self.convs:
+            res.append(conv(x))
+        res = torch.cat(res, dim=1)
+        return self.project(res)
 
 def _segm_hrnet_cct(name, backbone_name, num_classes, pretrained_backbone):
     backbone = hrnetv2.__dict__[backbone_name](pretrained_backbone)
@@ -415,56 +475,3 @@ def deeplabv3plus_resnet101_cct(num_classes=21, output_stride=8, pretrained_back
     return _segm_resnet_cct('deeplabv3plus_cct', 'resnet101', num_classes, 
                            output_stride=output_stride, 
                            pretrained_backbone=pretrained_backbone)
-
-class ASPPConv(nn.Sequential):
-    def __init__(self, in_channels, out_channels, dilation):
-        modules = [
-            nn.Conv2d(in_channels, out_channels, 3, padding=dilation, dilation=dilation, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU()
-        ]
-        super(ASPPConv, self).__init__(*modules)
-
-class ASPPPooling(nn.Sequential):
-    def __init__(self, in_channels, out_channels):
-        super(ASPPPooling, self).__init__(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(in_channels, out_channels, 1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU())
-
-    def forward(self, x):
-        size = x.shape[-2:]
-        x = super(ASPPPooling, self).forward(x)
-        return F.interpolate(x, size=size, mode='bilinear', align_corners=False)
-
-class ASPP(nn.Module):
-    def __init__(self, in_channels, atrous_rates):
-        super(ASPP, self).__init__()
-        out_channels = 256
-        modules = []
-        modules.append(nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU()))
-
-        rate1, rate2, rate3 = tuple(atrous_rates)
-        modules.append(ASPPConv(in_channels, out_channels, rate1))
-        modules.append(ASPPConv(in_channels, out_channels, rate2))
-        modules.append(ASPPConv(in_channels, out_channels, rate3))
-        modules.append(ASPPPooling(in_channels, out_channels))
-
-        self.convs = nn.ModuleList(modules)
-
-        self.project = nn.Sequential(
-            nn.Conv2d(5 * out_channels, out_channels, 1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(),
-            nn.Dropout(0.5))
-
-    def forward(self, x):
-        res = []
-        for conv in self.convs:
-            res.append(conv(x))
-        res = torch.cat(res, dim=1)
-        return self.project(res)
