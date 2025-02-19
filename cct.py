@@ -2,37 +2,34 @@
 The default exp_name is tmp. Change it before formal training! isic2018 PH2 DMF SKD
 nohup python -u multi_train_adapt.py --exp_name test --config_yml Configs/multi_train_local.yml --model MedFormer --batch_size 16 --adapt_method False --num_domains 1 --dataset PH2  --k_fold 4 > 4MedFormer_PH2.out 2>&1 &
 '''
+import os
+import time
 import argparse
-from email.headerregistry import DateHeader
-from sqlite3 import adapt
-import yaml
-import os, time
 from datetime import datetime
 import cv2
 
-import pandas as pd
+import yaml
+import numpy as np
+import torch
 import torch.nn as nn
-import torch.utils.data
+import torch.nn.functional as F
 import torch.optim as optim
-import medpy.metric.binary as metrics
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from itertools import cycle
+from monai.losses import *
+from monai.metrics import *
 
 from Datasets.create_dataset import *
-from Datasets.transform import normalize
-from Utils.losses import dice_loss
+from Models.DeepLabV3Plus.modeling import *
 from Utils.pieces import DotDict
 from Utils.functions import fix_all_seed
-
-from Models.Transformer.SwinUnetCCT4 import SwinUnet
-from itertools import cycle
 
 torch.cuda.empty_cache()
 
 def main(config):
     """
     Main training function.
-    
-    Args:
-        config: Configuration object containing training parameters
     """
     # Setup datasets and dataloaders
     dataset = get_dataset_without_full_label(
@@ -41,10 +38,10 @@ def main(config):
         train_aug=config.data.train_aug,
         k=config.fold,
         lb_dataset=Dataset,
-        ulb_dataset=StrongWeakAugment
+        ulb_dataset=StrongWeakAugment4
     )
-    
-    l_train_loader = DataLoader(
+      
+    l_train_loader = torch.utils.data.DataLoader(
         dataset['lb_dataset'],
         batch_size=config.train.l_batchsize,
         shuffle=True,
@@ -52,7 +49,7 @@ def main(config):
         pin_memory=True
     )
     
-    u_train_loader = DataLoader(
+    u_train_loader = torch.utils.data.DataLoader(
         dataset['ulb_dataset'],
         batch_size=config.train.u_batchsize,
         shuffle=True,
@@ -60,7 +57,7 @@ def main(config):
         pin_memory=True
     )
     
-    val_loader = DataLoader(
+    val_loader = torch.utils.data.DataLoader(
         dataset['val_dataset'],
         batch_size=config.test.batch_size,
         shuffle=False,
@@ -68,85 +65,87 @@ def main(config):
         pin_memory=True
     )
     
-    test_loader = DateHeader(
+    test_loader = torch.utils.data.DataLoader(
         dataset['val_dataset'],
         batch_size=config.test.batch_size,
         shuffle=False,
         num_workers=config.test.num_workers,
-        pin_memory=True,
-        drop_last=True
+        pin_memory=True
     )
     
     train_loader = {'l_loader': l_train_loader, 'u_loader': u_train_loader}
     print(f"Unlabeled batches: {len(u_train_loader)}, Labeled batches: {len(l_train_loader)}")
-    
-    # from thop import profile
-    # input = torch.randn(1,3,224,224)
-    # flops, params = profile(model, (input,))
-    # print(f"total flops : {flops/1e9} G")
 
-    # test model
-    # x = torch.randn(5,3,224,224)
-    # y = model(x)
-    # print(y.shape)
+    # Initialize model with CCT
+    model = deeplabv3plus_resnet101_cct(num_classes=3, output_stride=8, pretrained_backbone=True)
+
+    # Print model statistics
+    total_params = sum(p.numel() for p in model.parameters())
+    total_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f'{total_params/1e6:.2f}M total parameters')
+    print(f'{total_trainable_params/1e6:.2f}M trainable parameters')
 
     model = model.cuda()
-    
-    criterion = [nn.BCELoss(), dice_loss]
 
-    # only test
-    if config.test.only_test == True:
-        test(config, model, config.test.test_model_dir, test_loader, criterion)
-    else:
-        train_val(config, model, train_loader, val_loader, criterion)
-        test(config, model, best_model_dir, test_loader, criterion)
+    # Setup loss function
+    criterion = DiceCELoss(
+        include_background=True,
+        to_onehot_y=False,
+        softmax=True,
+        reduction='mean'
+    ).cuda()
+    criterion = [criterion]
+
+    # Train and test
+    train_val(config, model, train_loader, val_loader, criterion)
+    test(config, model, best_model_dir, test_loader, criterion)
 
 def sigmoid_rampup(current, rampup_length):
     """Exponential rampup from https://arxiv.org/abs/1610.02242"""
     if rampup_length == 0:
         return 1.0
-    else:
-        current = np.clip(current, 0.0, rampup_length)
-        phase = 1.0 - current / rampup_length
-        return float(np.exp(-5.0 * phase * phase))
+    current = np.clip(current, 0.0, rampup_length)
+    phase = 1.0 - current / rampup_length
+    return float(np.exp(-5.0 * phase * phase))
+
 def get_current_consistency_weight(epoch):
-    # Consistency ramp-up from https://arxiv.org/abs/1610.02242
     return args.consistency * sigmoid_rampup(epoch, args.consistency_rampup)
 
-# =======================================================================================================
 def train_val(config, model, train_loader, val_loader, criterion):
-    # optimizer loss
-    if config.train.optimizer.mode == 'adam':
-        # optimizer = optim.Adam(model.parameters(), lr=float(config.train.optimizer.adam.lr))
-        print('choose wrong optimizer')
-    elif config.train.optimizer.mode == 'adamw':
-        optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),lr=float(config.train.optimizer.adamw.lr),
-                                weight_decay=float(config.train.optimizer.adamw.weight_decay))
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
+    """
+    Training and validation function for CCT.
+    """
+    optimizer = optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=float(config.train.optimizer.adamw.lr),
+        weight_decay=float(config.train.optimizer.adamw.weight_decay)
+    )
+    
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.train.num_epochs)
 
-    # ---------------------------------------------------------------------------
-    # Training and Validating
-    #----------------------------------------------------------------------------
-    epochs = config.train.num_epochs
-    max_iou = 0 # use for record best model
-    max_dice = 0 # use for record best model
-    best_epoch = 0 # use for recording the best epoch
-    # create training data loading iteration
+    # Initialize MONAI metrics
+    train_dice = DiceMetric(include_background=True, reduction="mean")
+    max_dice = -float('inf')
+    best_epoch = 0
+    iter_num = 0
     
     torch.save(model.state_dict(), best_model_dir)
-    for epoch in range(epochs):
+    
+    for epoch in range(config.train.num_epochs):
         start = time.time()
-        # ----------------------------------------------------------------------
-        # train
-        # ---------------------------------------------------------------------
+        
+        # Training phase
         model.train()
-        dice_train_sum= 0
-        iou_train_sum = 0
-        loss_train_sum = 0
+        train_metrics = {'dice': 0, 'loss': 0}
         num_train = 0
-        iter = 0
+        
         source_dataset = zip(cycle(train_loader['l_loader']), train_loader['u_loader'])
-        for idx, (batch, batch_w_s) in enumerate(source_dataset):
+        train_loop = tqdm(source_dataset, desc=f'Epoch {epoch} Training', leave=False)
+        
+        train_dice.reset()
+        
+        for idx, (batch, batch_w_s) in enumerate(train_loop):
+            # Get batch data
             img = batch['image'].cuda().float()
             label = batch['label'].cuda().float()
             weak_batch = batch_w_s['img_w'].cuda().float()
@@ -154,245 +153,232 @@ def train_val(config, model, train_loader, val_loader, criterion):
             sup_batch_len = img.shape[0]
             unsup_batch_len = weak_batch.shape[0]
             
-            output, _, _, _ = model(img)
-            output = torch.sigmoid(output)
+            # Forward pass with CCT for labeled and unlabeled data
+            outputs, outputs_aux1, outputs_aux2, outputs_aux3 = model(img)  # labeled data
+            u_outputs, u_outputs_aux1, u_outputs_aux2, u_outputs_aux3 = model(weak_batch)  # unlabeled data
             
-            # calculate loss
-            assert (output.shape == label.shape)
-            losses = []
-            for function in criterion:
-                losses.append(function(output, label))
-            
-            # FixMatch
-            #======================================================================================================
-            # outputs for model
-            main_seg, aux1_seg, aux2_seg, aux3_seg = model(weak_batch)
-            main_seg = torch.sigmoid(main_seg)
-            aux1_seg = torch.sigmoid(aux1_seg)
-            aux2_seg = torch.sigmoid(aux2_seg)
-            aux3_seg = torch.sigmoid(aux3_seg)
+            # Apply softmax
+            outputs_soft = F.softmax(outputs, dim=1)
+            outputs_aux1_soft = F.softmax(outputs_aux1, dim=1)
+            outputs_aux2_soft = F.softmax(outputs_aux2, dim=1)
+            outputs_aux3_soft = F.softmax(outputs_aux3, dim=1)
 
-            # calculate loss
-            for function in criterion:
-                unsup_losses = []
-                unsup_losses.append(function(main_seg, aux1_seg))
-                unsup_losses.append(function(main_seg, aux2_seg))
-                unsup_losses.append(function(main_seg, aux3_seg))
-                losses.append(sum(unsup_losses) / 3)
-            #======================================================================================================
-            consistency_weight = get_current_consistency_weight(iter // 150)
-            sup_loss = (losses[0] + losses[1]) / 2
-            unsup_loss = (losses[2] + losses[3]) / 2
-            loss = sup_loss + unsup_loss * (sup_batch_len / unsup_batch_len) * consistency_weight
+            u_outputs_soft = F.softmax(u_outputs, dim=1)
+            u_outputs_aux1_soft = F.softmax(u_outputs_aux1, dim=1)
+            u_outputs_aux2_soft = F.softmax(u_outputs_aux2, dim=1)
+            u_outputs_aux3_soft = F.softmax(u_outputs_aux3, dim=1)
             
+            # Calculate supervised losses for labeled data
+            loss_ce = criterion[0](outputs, label)
+            loss_ce_aux1 = criterion[0](outputs_aux1, label)
+            loss_ce_aux2 = criterion[0](outputs_aux2, label)
+            loss_ce_aux3 = criterion[0](outputs_aux3, label)
+            
+            # Combine supervised losses
+            supervised_loss = (loss_ce + loss_ce_aux1 + loss_ce_aux2 + loss_ce_aux3) / 4
+            
+            # Calculate consistency loss for unlabeled data
+            consistency_weight = get_current_consistency_weight(iter_num // 150)
+            consistency_loss_aux1 = torch.mean(
+                (u_outputs_soft - u_outputs_aux1_soft) ** 2)
+            consistency_loss_aux2 = torch.mean(
+                (u_outputs_soft - u_outputs_aux2_soft) ** 2)
+            consistency_loss_aux3 = torch.mean(
+                (u_outputs_soft - u_outputs_aux3_soft) ** 2)
+
+            consistency_loss = (consistency_loss_aux1 + consistency_loss_aux2 + consistency_loss_aux3) / 3
+
+            # Clip gradient norm
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            # Check for NaN values
+            if torch.isnan(consistency_loss):
+                consistency_loss = torch.tensor(0.0).cuda()
+            if torch.isnan(supervised_loss):
+                supervised_loss = torch.tensor(0.0).cuda()
+
+            # Total loss
+            loss = supervised_loss + consistency_weight * consistency_loss
+            
+            # Log losses
+            # print(f"Supervised Loss: {supervised_loss.item():.4f}")
+            # print(f"Consistency Loss: {consistency_loss.item():.4f}")
+            # print(f"Consistency Weight: {consistency_weight:.4f}")
+            # Optimization
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            loss_train_sum += loss.item() * sup_batch_len
             
-            # calculate metrics
+            # Calculate metrics
             with torch.no_grad():
-                output = output.cpu().numpy() > 0.5
-                label = label.cpu().numpy()
-                assert (output.shape == label.shape)
-                dice_train = metrics.dc(output, label)
-                iou_train = metrics.jc(output, label)
-                dice_train_sum += dice_train * sup_batch_len
-                iou_train_sum += iou_train * sup_batch_len
-                 
-            file_log.write('Epoch {}, iter {}, Dice Sup Loss: {}, Dice Unsup Loss: {}, BCE Sup Loss: {}, BCE UnSup Loss: {}\n'.format(
-                epoch, iter + 1, round(losses[1].item(), 5), round(losses[3].item(), 5), round(losses[0].item(), 5), round(losses[2].item(), 5)
-            ))
-            file_log.flush()
-            print('Epoch {}, iter {}, Dice Sup Loss: {}, Dice Unsup Loss: {}, BCE Sup Loss: {}, BCE UnSup Loss: {}'.format(
-                epoch, iter + 1, round(losses[1].item(), 5), round(losses[3].item(), 5), round(losses[0].item(), 5), round(losses[2].item(), 5)
-            ))
-            
-            num_train += sup_batch_len
-            iter += 1
-            
-            # end one test batch
-            if config.debug: break
+                output = torch.softmax(outputs, dim=1)
+                output_onehot = torch.zeros_like(output)
+                output_onehot.scatter_(1, output.argmax(dim=1, keepdim=True), 1)
                 
-
-        # print
-        file_log.write('Epoch {}, Total train step {} || AVG_loss: {}, Avg Dice score: {}, Avg IOU: {}\n'.format(epoch, 
-                                                                                                      iter, 
-                                                                                                      round(loss_train_sum / num_train,5), 
-                                                                                                      round(dice_train_sum/num_train,4), 
-                                                                                                      round(iou_train_sum/num_train,4)))
-        file_log.flush()
-        print('Epoch {}, Total train step {} || AVG_loss: {}, Avg Dice score: {}, Avg IOU: {}'.format(epoch, 
-                                                                                                      iter, 
-                                                                                                      round(loss_train_sum / num_train,5), 
-                                                                                                      round(dice_train_sum/num_train,4), 
-                                                                                                      round(iou_train_sum/num_train,4)))
+                train_dice(y_pred=output_onehot, y=label)
+                
+                train_metrics['loss'] = (train_metrics['loss'] * num_train + loss.item() * sup_batch_len) / (num_train + sup_batch_len)
+                num_train += sup_batch_len
             
-
-
-        # -----------------------------------------------------------------
-        # validate
-        # ----------------------------------------------------------------
-        model.eval()
-        
-        dice_val_sum= 0
-        iou_val_sum = 0
-        loss_val_sum = 0
-        num_val = 0
-
-        for batch_id, batch in enumerate(val_loader):
-            img = batch['image'].cuda().float()
-            label = batch['label'].cuda().float()
+            # Log training progress
+            train_loop.set_postfix({
+                'Loss': f"{loss.item() if not torch.isnan(loss) else 'NaN'}",
+                'Sup Loss': f"{supervised_loss.item() if not torch.isnan(supervised_loss) else 'NaN'}",
+                'Unsup Loss': f"{consistency_loss.item() if not torch.isnan(consistency_loss) else 'NaN'}",
+                'Dice': f"{train_dice.aggregate().item():.4f}"
+            })
             
-            batch_len = img.shape[0]
-
-            with torch.no_grad():
-                output, _, _, _ = model(img)
-                    
-                output = torch.sigmoid(output)
-
-                # calculate loss
-                assert (output.shape == label.shape)
-                losses = []
-                for function in criterion:
-                    losses.append(function(output, label))
-                loss_val_sum += sum(losses)*batch_len / 2
-
-                # calculate metrics
-                output = output.cpu().numpy() > 0.5
-                label = label.cpu().numpy()
-                dice_val_sum += metrics.dc(output, label)*batch_len
-                iou_val_sum += metrics.jc(output, label)*batch_len
-
-                num_val += batch_len
-                # end one val batch
-                if config.debug: break
-
-        # logging per epoch for one dataset
-        loss_val_epoch, dice_val_epoch, iou_val_epoch = loss_val_sum/num_val, dice_val_sum/num_val, iou_val_sum/num_val
-        
-        file_log.write('Epoch {}, Validation || sum_loss: {}, Dice score: {}, IOU: {}\n'.
-                format(epoch, round(loss_val_epoch.item(),5), 
-                round(dice_val_epoch,4), round(iou_val_epoch,4)))
-        file_log.flush()
-        # print
-        print('Epoch {}, Validation || sum_loss: {}, Dice score: {}, IOU: {}'.
-                format(epoch, round(loss_val_epoch.item(),5), 
-                round(dice_val_epoch,4), round(iou_val_epoch,4)))
-
-
-        # scheduler step, record lr
-        scheduler.step()
-
-        # store model using the average iou
-        if dice_val_epoch > max_dice:
-            torch.save(model.state_dict(), best_model_dir)
-            max_dice = dice_val_epoch
-            best_epoch = epoch
-            file_log.write('New best epoch {}!===============================\n'.format(epoch))
+            file_log.write(f'Epoch {epoch}, iter {iter_num}, Loss: {loss.item():.4f}, '
+                          f'Sup Loss: {supervised_loss.item():.4f}, '
+                          f'Unsup Loss: {consistency_loss.item():.4f}\n')
             file_log.flush()
-            print('New best epoch {}!==============================='.format(epoch))
+            
+            iter_num += 1
+            if config.debug: break
         
-        end = time.time()
-        time_elapsed = end-start
-        file_log.write('Training and evaluating on epoch{} complete in {:.0f}m {:.0f}s\n'.
-                    format(epoch, time_elapsed // 60, time_elapsed % 60))
-        file_log.flush()
-        print('Training and evaluating on epoch{} complete in {:.0f}m {:.0f}s'.
-                    format(epoch, time_elapsed // 60, time_elapsed % 60))
-
-        # end one epoch
-        if config.debug: return
+        # Get final training metrics
+        train_metrics['dice'] = train_dice.aggregate().item()
+        
+        # Validation phase
+        val_metrics = validate_model(model, val_loader, criterion)
+        
+        # Save best model
+        if val_metrics['dice'] > max_dice:
+            max_dice = val_metrics['dice']
+            best_epoch = epoch
+            torch.save(model.state_dict(), best_model_dir)
+            
+            message = f'New best epoch {epoch}! Dice: {val_metrics["dice"]:.4f}'
+            print(message)
+            file_log.write(message + '\n')
+            file_log.flush()
+        
+        # Update learning rate
+        scheduler.step()
+        
+        # Log epoch time
+        time_elapsed = time.time() - start
+        print(f'Epoch {epoch} completed in {time_elapsed//60:.0f}m {time_elapsed%60:.0f}s')
+        
+        if config.debug: break
     
-    file_log.write('Complete training ---------------------------------------------------- \n The best epoch is {}\n'.format(best_epoch))
-    file_log.flush()
-    print('Complete training ---------------------------------------------------- \n The best epoch is {}'.format(best_epoch))
-
-    return 
-
-
-
-
-# ========================================================================================================
-def test(config, model, model_dir, test_loader, criterion):
-    model.load_state_dict(torch.load(model_dir))
+    print(f'Training completed. Best epoch: {best_epoch}')
+    return model
+def validate_model(model, val_loader, criterion):
+    """
+    Validate a single model using MONAI metrics.
+    
+    Args:
+        model: Model to validate
+        val_loader: Validation data loader
+        criterion: Loss function(s)
+    
+    Returns:
+        Dictionary containing validation metrics
+    """
     model.eval()
-    dice_test_sum= 0
-    iou_test_sum = 0
-    loss_test_sum = 0
-    num_test = 0
-    for batch_id, batch in enumerate(test_loader):
+    metrics = {'dice': 0, 'iou': 0, 'hd': 0, 'loss': 0}
+    num_val = 0
+    
+    # Initialize MONAI metrics
+    dice_metric = DiceMetric(include_background=True, reduction="mean")
+    iou_metric = MeanIoU(include_background=True, reduction="mean")
+    hd_metric = HausdorffDistanceMetric(include_background=True, percentile=95.0)
+    
+    val_loop = tqdm(val_loader, desc='Validation', leave=False)
+    for batch in val_loop:
         img = batch['image'].cuda().float()
         label = batch['label'].cuda().float()
-
         batch_len = img.shape[0]
-            
+        
         with torch.no_grad():
-                
-            output, _, _, _ = model(img)
+            output = torch.softmax(model(img), dim=1)
+            loss = criterion[0](output, label)
+            
+            # Convert predictions to one-hot format
+            preds = torch.argmax(output, dim=1, keepdim=True)
+            preds_onehot = torch.zeros_like(output)
+            preds_onehot.scatter_(1, preds, 1)
+            
+            # Convert labels to one-hot format if needed
+            if len(label.shape) == 4:  # If already one-hot
+                labels_onehot = label
+            else:  # If not one-hot
+                labels_onehot = torch.zeros_like(output)
+                labels_onehot.scatter_(1, label.unsqueeze(1), 1)
+            
+            # Compute metrics
+            dice_metric(y_pred=preds_onehot, y=labels_onehot)
+            iou_metric(y_pred=preds_onehot, y=labels_onehot)
+            hd_metric(y_pred=preds_onehot, y=labels_onehot)
+            
+            # Update loss
+            metrics['loss'] = (metrics['loss'] * num_val + loss.item() * batch_len) / (num_val + batch_len)
+            num_val += batch_len
+            
+            val_loop.set_postfix({
+                'Loss': f"{loss.item():.4f}"
+            })
+    
+    # Aggregate metrics
+    metrics['dice'] = dice_metric.aggregate().item()
+    metrics['iou'] = iou_metric.aggregate().item()
+    metrics['hd'] = hd_metric.aggregate().item()
+    
+    # Reset metrics for next validation
+    dice_metric.reset()
+    iou_metric.reset()
+    hd_metric.reset()
+    
+    return metrics
 
-            output = torch.sigmoid(output)
-
-            # calculate loss
-            assert (output.shape == label.shape)
-            losses = []
-            for function in criterion:
-                losses.append(function(output, label))
-            loss_test_sum += sum(losses)*batch_len
-
-            # calculate metrics
-            output = output.cpu().numpy() > 0.5
-            label = label.cpu().numpy()
-            dice_test_sum += metrics.dc(output, label)*batch_len
-            iou_test_sum += metrics.jc(output, label)*batch_len
-
-            num_test += batch_len
-            # end one test batch
-            if config.debug: break
-
-    # logging results for one dataset
-    loss_test_epoch, dice_test_epoch, iou_test_epoch = loss_test_sum/num_test, dice_test_sum/num_test, iou_test_sum/num_test
-
-
-    # logging average and store results
+def test(config, model, model_dir, test_loader, criterion):
+    """
+    Test the model on the test set.
+    """
+    model.load_state_dict(torch.load(model_dir))
+    metrics = validate_model(model, test_loader, criterion)
+    
+    # Save and print results
+    results_str = (f"Test Results:\n"
+                  f"Loss: {metrics['loss']:.4f}\n"
+                  f"Dice: {metrics['dice']:.4f}\n"
+                  f"IoU: {metrics['iou']:.4f}\n"
+                  f"HD: {metrics['hd']:.4f}")
+    
     with open(test_results_dir, 'w') as f:
-        f.write(f'loss: {loss_test_epoch.item()}, Dice_score {dice_test_epoch}, IOU: {iou_test_epoch}')
-
-    # print
-    file_log.write('========================================================================================\n')
-    file_log.write('Test || Average loss: {}, Dice score: {}, IOU: {}\n'.
-                        format(round(loss_test_epoch.item(),5), 
-                        round(dice_test_epoch,4), round(iou_test_epoch,4)))
+        f.write(results_str)
+    
+    print('='*80)
+    print(results_str)
+    print('='*80)
+    
+    file_log.write('\n' + '='*80 + '\n')
+    file_log.write(results_str + '\n')
+    file_log.write('='*80 + '\n')
     file_log.flush()
-    print('========================================================================================')
-    print('Test || Average loss: {}, Dice score: {}, IOU: {}'.
-            format(round(loss_test_epoch.item(),5), 
-            round(dice_test_epoch,4), round(iou_test_epoch,4)))
-
-    return
-
-
-
 
 if __name__=='__main__':
     now = datetime.now()
     torch.cuda.empty_cache()
     parser = argparse.ArgumentParser(description='Train experiment')
     parser.add_argument('--exp', type=str,default='tmp')
-    parser.add_argument('--config_yml', type=str,default='Configs/multi_train_local.yml')
+    parser.add_argument('--config_yml', type=str,default='Configs/cf_fugc.yml')
     parser.add_argument('--adapt_method', type=str, default=False)
     parser.add_argument('--num_domains', type=str, default=False)
-    parser.add_argument('--dataset', type=str, nargs='+', default='isic2018')
+    parser.add_argument('--dataset', type=str, nargs='+', default='chase_db1')
     parser.add_argument('--k_fold', type=str, default='No')
     parser.add_argument('--gpu', type=str, default='0')
     parser.add_argument('--seed', type=int, default=1)
-    parser.add_argument('--fold', type=int, default=1)
+    parser.add_argument('--fold', type=int, default=2)
     parser.add_argument('--consistency', type=float,
-                    default=0.1, help='consistency')
+                    default=1.0, help='consistency')
     parser.add_argument('--consistency_rampup', type=float,
-                    default=200.0, help='consistency_rampup')
+                    default=75.0, help='consistency_rampup')
     args = parser.parse_args()
+    
     config = yaml.load(open(args.config_yml), Loader=yaml.FullLoader)
+    config['data']['name'] = args.dataset
     config['model_adapt']['adapt_method']=args.adapt_method
     config['model_adapt']['num_domains']=args.num_domains
     config['data']['k_fold'] = args.k_fold
@@ -413,15 +399,23 @@ if __name__=='__main__':
     store_config = config
     config = DotDict(config)
     
-    # logging tensorbord, config, best model
-    exp_dir = '{}/{}_{}/fold{}'.format(config.data.save_folder, args.exp, config['data']['supervised_ratio'], args.fold)
-    os.makedirs(exp_dir, exist_ok=True)
-    best_model_dir = '{}/best.pth'.format(exp_dir)
-    test_results_dir = '{}/test_results.txt'.format(exp_dir)
-
-    # store yml file
-    if config.debug == False:
-        yaml.dump(store_config, open('{}/exp_config.yml'.format(exp_dir), 'w'))
+    folds_to_train = [1,2,3,4,5]
     
-    file_log = open('{}/log.txt'.format(exp_dir), 'w')
-    main(config)
+    for fold in folds_to_train:
+        print(f"\n=== Training Fold {fold} ===")
+        config['fold'] = fold
+        
+        exp_dir = '{}/{}/fold{}'.format(config.data.save_folder, args.exp, fold)
+        os.makedirs(exp_dir, exist_ok=True)
+        best_model_dir = '{}/best.pth'.format(exp_dir)
+        test_results_dir = '{}/test_results.txt'.format(exp_dir)
+
+        if config.debug == False:
+            yaml.dump(store_config, open('{}/exp_config.yml'.format(exp_dir), 'w'))
+            
+        file_log = open('{}/log.txt'.format(exp_dir), 'w')
+        
+        main(config)
+        
+        file_log.close()
+        torch.cuda.empty_cache()
